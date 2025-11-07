@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trusted-ca
+  namespace: kube-system
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    YOURCACERT PEM
+    -----END CERTIFICATE-----
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  namespace: kube-system
+  name: node-custom-setup
+  labels:
+    k8s-app: node-custom-setup
+spec:
+  selector:
+    matchLabels:
+      k8s-app: node-custom-setup
+  template:
+    metadata:
+      labels:
+        k8s-app: node-custom-setup
+    spec:
+      hostPID: true
+      hostNetwork: true
+      initContainers:
+      - name: init-node
+        command: [ "nsenter" ]
+        args:
+        - "--mount=/proc/1/ns/mnt"
+        - "--"
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          echo "=== Starting certificate installation on $(hostname) ==="
+          echo "=== Creating certificate directory ==="
+          mkdir -p /etc/pki/ca-trust/source/anchors/
+          echo "=== Writing Proxy certificate ==="
+          echo "$TRUSTED_CERT" > /etc/pki/ca-trust/source/anchors/ca.crt
+          echo "=== Verifying certificate file ==="
+          ls -la /etc/pki/ca-trust/source/anchors/ca.crt
+          echo "=== Validating certificate format ==="
+          if ! openssl x509 -in /etc/pki/ca-trust/source/anchors/ca.crt -noout -subject -issuer; then
+            echo "ERROR: Certificate validation failed"
+            exit 1
+          fi
+          echo "=== Updating CA trust store ==="
+          update-ca-trust
+          echo "=== Creating cron job for containerd restart ==="
+          # Create the restart script
+          cat > /usr/local/bin/restart-containerd-proxy.sh << 'EOF'
+          #!/bin/bash
+          # Restart containerd and log the result
+          exec > /var/log/proxy-containerd-restart.log 2>&1
+          echo "$(date): Starting scheduled containerd restart for Proxy certificate"
+          # Check if certificate installation marker exists
+          if [ -f /tmp/proxy-cert-installed ]; then
+            echo "$(date): Certificate installation confirmed, restarting containerd"
+            systemctl restart containerd
+            if [ $? -eq 0 ]; then
+              echo "$(date): Containerd restarted successfully"
+              systemctl status containerd --no-pager
+              # Remove the cron job after successful restart
+              crontab -l | grep -v "restart-containerd-proxy" | crontab -
+              echo "$(date): Cron job removed after successful restart"
+              # Clean up the script and marker
+              rm -f /tmp/zscaler-cert-installed
+              rm -f /usr/local/bin/restart-containerd-zscaler.sh
+              echo "$(date): Cleanup completed"
+            else
+              echo "$(date): Containerd restart failed"
+            fi
+          else
+            echo "$(date): Certificate installation marker not found, skipping restart"
+          fi
+          EOF
+          chmod +x /usr/local/bin/restart-containerd-zscaler.sh
+          # Create completion marker for cron job to detect
+          echo "$(date): Certificate installation completed on $(hostname)" > /tmp/zscaler-cert-installed
+          # Schedule cron job to run in 2 minutes
+          CRON_TIME=$(date -d "+2 minutes" "+%M %H %d %m *")
+          echo "$CRON_TIME /usr/local/bin/restart-containerd-zscaler.sh" | crontab -
+          echo "=== Certificate installation completed on $(hostname) ==="
+          echo "=== Containerd restart scheduled via cron for 2 minutes from now ==="
+          echo "=== Cron job: $CRON_TIME /usr/local/bin/restart-containerd-zscaler.sh ==="
+          # Show current cron jobs for verification
+          echo "=== Current cron jobs: ==="
+          crontab -l
+          exit 0
+        image: mcr.microsoft.com/devcontainers/base:debian
+        env:
+        - name: TRUSTED_CERT
+          valueFrom:
+            configMapKeyRef:
+              name: trusted-ca
+              key: ca.crt
+        securityContext:
+          privileged: true
+      containers:
+      - name: monitor
+        image: mcr.microsoft.com/oss/kubernetes/pause:3.10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 32Mi
+      tolerations:
+      - operator: Exists
+      terminationGracePeriodSeconds: 60
